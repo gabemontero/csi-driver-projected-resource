@@ -44,8 +44,8 @@ func TestCreateHostPathVolumeBadAccessType(t *testing.T) {
 		t.Fatalf("%s", err.Error())
 	}
 	defer os.RemoveAll(dir)
-	_, err = hp.createHostpathVolume("volID", "podNamespace", "podName", "podUID",
-		"podSA", "", 0, mountAccess+1)
+	volPath := hp.getVolumePath("volID", "podNamespace", "podName", "podUID", "podSA")
+	_, err = hp.createHostpathVolume("volID", volPath, "", 0, mountAccess+1)
 	if err == nil {
 		t.Fatalf("err nil unexpectedly")
 	}
@@ -54,7 +54,7 @@ func TestCreateHostPathVolumeBadAccessType(t *testing.T) {
 	}
 }
 
-func TestCreateHostPathVolume(t *testing.T) {
+func TestCreateConfigMapHostPathVolume(t *testing.T) {
 	hp, dir, err := testHostPathDriver()
 	if err != nil {
 		t.Fatalf("%s", err.Error())
@@ -65,30 +65,19 @@ func TestCreateHostPathVolume(t *testing.T) {
 		t.Fatalf("err on targetPath %s", err.Error())
 	}
 	defer os.RemoveAll(targetPath)
-	secret, cm := primeVolume(hp, targetPath, t)
-
-	foundSecret, foundConfigMap := findSharedItems(targetPath, t)
-	if !foundSecret {
-		t.Fatalf("did not find secret in mount path")
-	}
+	cm := primeConfigMapVolume(hp, targetPath, t)
+	_, foundConfigMap := findSharedItems(targetPath, t)
 	if !foundConfigMap {
 		t.Fatalf("did not find configmap in mount path")
 	}
-
-	cache.DelSecret(secret)
 	cache.DelConfigMap(cm)
-
-	foundSecret, foundConfigMap = findSharedItems(dir, t)
-
-	if foundSecret {
-		t.Fatalf("secret not deleted")
-	}
+	_, foundConfigMap = findSharedItems(targetPath, t)
 	if foundConfigMap {
 		t.Fatalf("configmap not deleted")
 	}
 }
 
-func TestDeleteHostPathVolume(t *testing.T) {
+func TestCreateSecretHostPathVolume(t *testing.T) {
 	hp, dir, err := testHostPathDriver()
 	if err != nil {
 		t.Fatalf("%s", err.Error())
@@ -99,32 +88,78 @@ func TestDeleteHostPathVolume(t *testing.T) {
 		t.Fatalf("err on targetPath %s", err.Error())
 	}
 	defer os.RemoveAll(targetPath)
-	primeVolume(hp, targetPath, t)
+	secret := primeSecretVolume(hp, targetPath, t)
+	foundSecret, _ := findSharedItems(targetPath, t)
+	if !foundSecret {
+		t.Fatalf("did not find secret in mount path")
+	}
+	cache.DelSecret(secret)
+	foundSecret, _ = findSharedItems(targetPath, t)
+	if foundSecret {
+		t.Fatalf("secret not deleted")
+	}
+}
 
+func TestDeleteSecretVolume(t *testing.T) {
+	hp, dir, err := testHostPathDriver()
+	if err != nil {
+		t.Fatalf("%s", err.Error())
+	}
+	defer os.RemoveAll(dir)
+	targetPath, err := ioutil.TempDir(os.TempDir(), "ut")
+	if err != nil {
+		t.Fatalf("err on targetPath %s", err.Error())
+	}
+	defer os.RemoveAll(targetPath)
+	primeSecretVolume(hp, targetPath, t)
 	err = hp.deleteHostpathVolume("volID")
 	if err != nil {
 		t.Fatalf("unexpeted error on delete volume: %s", err.Error())
 	}
-	foundSecret, foundConfigMap := findSharedItems(dir, t)
+	foundSecret, _ := findSharedItems(dir, t)
 
 	if foundSecret {
 		t.Fatalf("secret not deleted")
 	}
+	if empty, err := isDirEmpty(dir); !empty || err != nil {
+		t.Fatalf("volume directory not cleaned out empty %v err %s", empty, err.Error())
+	}
+
+}
+
+func TestDeleteConfigMapVolume(t *testing.T) {
+	hp, dir, err := testHostPathDriver()
+	if err != nil {
+		t.Fatalf("%s", err.Error())
+	}
+	defer os.RemoveAll(dir)
+	targetPath, err := ioutil.TempDir(os.TempDir(), "ut")
+	if err != nil {
+		t.Fatalf("err on targetPath %s", err.Error())
+	}
+	defer os.RemoveAll(targetPath)
+	primeConfigMapVolume(hp, targetPath, t)
+	err = hp.deleteHostpathVolume("volID")
+	if err != nil {
+		t.Fatalf("unexpeted error on delete volume: %s", err.Error())
+	}
+	_, foundConfigMap := findSharedItems(dir, t)
+
 	if foundConfigMap {
 		t.Fatalf("configmap not deleted")
 	}
 	if empty, err := isDirEmpty(dir); !empty || err != nil {
 		t.Fatalf("volume directory not cleaned out empty %v err %s", empty, err.Error())
 	}
+
 }
 
-func primeVolume(hp *hostPath, targetPath string, t *testing.T) (*corev1.Secret, *corev1.ConfigMap) {
-	hpv, err := hp.createHostpathVolume("volID", "podNamespace", "podName", "podUID",
-		"podSA", targetPath, 0, mountAccess)
+func primeSecretVolume(hp *hostPath, targetPath string, t *testing.T) *corev1.Secret {
+	volPath := hp.getVolumePath("volID", "podNamespace", "podName", "podUID", "podSA")
+	hpv, err := hp.createHostpathVolume("volID", volPath, targetPath, 0, mountAccess)
 	if err != nil {
 		t.Fatalf("unexpected err %s", err.Error())
 	}
-
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "secret1",
@@ -132,8 +167,23 @@ func primeVolume(hp *hostPath, targetPath string, t *testing.T) (*corev1.Secret,
 		},
 	}
 
-	cache.UpsertSecret(secret)
+	hpv.SharedDataKind = "Secret"
+	hpv.SharedDataKey = cache.BuildKey(secret.Namespace, secret.Name)
 
+	cache.UpsertSecret(secret)
+	err = hp.mapVolumeToPod(hpv)
+	if err != nil {
+		t.Fatalf("unexpected err %s", err.Error())
+	}
+	return secret
+}
+
+func primeConfigMapVolume(hp *hostPath, targetPath string, t *testing.T) *corev1.ConfigMap {
+	volPath := hp.getVolumePath("volID", "podNamespace", "podName", "podUID", "podSA")
+	hpv, err := hp.createHostpathVolume("volID", volPath, targetPath, 0, mountAccess)
+	if err != nil {
+		t.Fatalf("unexpected err %s", err.Error())
+	}
 	cm := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "configmap1",
@@ -141,13 +191,15 @@ func primeVolume(hp *hostPath, targetPath string, t *testing.T) (*corev1.Secret,
 		},
 	}
 
-	cache.UpsertConfigMap(cm)
+	hpv.SharedDataKind = "ConfigMap"
+	hpv.SharedDataKey = cache.BuildKey(cm.Namespace, cm.Name)
 
+	cache.UpsertConfigMap(cm)
 	err = hp.mapVolumeToPod(hpv)
 	if err != nil {
 		t.Fatalf("unexpected err %s", err.Error())
 	}
-	return secret, cm
+	return cm
 }
 
 func findSharedItems(dir string, t *testing.T) (bool, bool) {

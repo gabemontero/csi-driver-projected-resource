@@ -13,8 +13,11 @@ import (
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
 
+	sharev1alpha1 "github.com/openshift/csi-driver-projected-resource/pkg/api/projectedresource/v1alpha1"
 	objcache "github.com/openshift/csi-driver-projected-resource/pkg/cache"
 	"github.com/openshift/csi-driver-projected-resource/pkg/client"
+	shareclientv1alpha1 "github.com/openshift/csi-driver-projected-resource/pkg/generated/clientset/versioned"
+	shareinformer "github.com/openshift/csi-driver-projected-resource/pkg/generated/informers/externalversions"
 )
 
 const (
@@ -25,16 +28,27 @@ var (
 	singleton *Controller
 )
 
+func GetController() *Controller {
+	return singleton
+}
+
+func SetController(controller *Controller) {
+	singleton = controller
+}
+
 type Controller struct {
 	kubeRestConfig *rest.Config
 
 	cfgMapWorkqueue workqueue.RateLimitingInterface
 	secretWorkqueue workqueue.RateLimitingInterface
+	shareWorkqueue  workqueue.RateLimitingInterface
 
 	cfgMapInformer cache.SharedIndexInformer
 	secInformer    cache.SharedIndexInformer
+	shareInformer  cache.SharedIndexInformer
 
-	informerFactory informers.SharedInformerFactory
+	shareInformerFactory shareinformer.SharedInformerFactory
+	informerFactory      informers.SharedInformerFactory
 
 	listers *client.Listers
 }
@@ -50,9 +64,18 @@ func NewController() (*Controller, error) {
 		return nil, err
 	}
 
+	shareClient, err := shareclientv1alpha1.NewForConfig(kubeRestConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	// NOTE, not specifying a namespace defaults to metav1.NamespaceAll in
+	// informers.NewSharedInformerFactoryWithOptions
 	informerFactory := informers.NewSharedInformerFactoryWithOptions(kubeClient,
-		defaultResyncDuration,
-		informers.WithNamespace("openshift-config"))
+		defaultResyncDuration)
+
+	shareInformerFactory := shareinformer.NewSharedInformerFactoryWithOptions(shareClient,
+		defaultResyncDuration)
 
 	c := &Controller{
 		kubeRestConfig: kubeRestConfig,
@@ -60,27 +83,46 @@ func NewController() (*Controller, error) {
 			"projected-resource-configmap-changes"),
 		secretWorkqueue: workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(),
 			"projected-resource-secret-changes"),
-		informerFactory: informerFactory,
-		cfgMapInformer:  informerFactory.Core().V1().ConfigMaps().Informer(),
-		secInformer:     informerFactory.Core().V1().Secrets().Informer(),
-		listers:         &client.Listers{},
+		shareWorkqueue: workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(),
+			"projected-resource-share-changes"),
+		informerFactory:      informerFactory,
+		shareInformerFactory: shareInformerFactory,
+		cfgMapInformer:       informerFactory.Core().V1().ConfigMaps().Informer(),
+		secInformer:          informerFactory.Core().V1().Secrets().Informer(),
+		shareInformer:        shareInformerFactory.Projectedresource().V1alpha1().Shares().Informer(),
+		listers:              &client.Listers{},
 	}
+
+	c.listers.ConfigMaps = c.informerFactory.Core().V1().ConfigMaps().Lister()
+	c.listers.Secrets = c.informerFactory.Core().V1().Secrets().Lister()
+	c.listers.Shares = c.shareInformerFactory.Projectedresource().V1alpha1().Shares().Lister()
 
 	c.cfgMapInformer.AddEventHandler(c.configMapEventHandler())
 	c.secInformer.AddEventHandler(c.secretEventHandler())
+	c.shareInformer.AddEventHandler(c.shareEventHandler())
 
 	singleton = c
 
 	return c, nil
 }
 
+func (c *Controller) GetListers() *client.Listers {
+	return c.listers
+}
+
+func (c *Controller) SetListers(listers *client.Listers) {
+	c.listers = listers
+}
+
 func (c *Controller) Run(stopCh <-chan struct{}) error {
 	defer c.cfgMapWorkqueue.ShutDown()
 	defer c.secretWorkqueue.ShutDown()
+	defer c.shareWorkqueue.ShutDown()
 
 	c.informerFactory.Start(stopCh)
+	c.shareInformerFactory.Start(stopCh)
 
-	if !cache.WaitForCacheSync(stopCh, c.cfgMapInformer.HasSynced, c.secInformer.HasSynced) {
+	if !cache.WaitForCacheSync(stopCh, c.cfgMapInformer.HasSynced, c.secInformer.HasSynced, c.shareInformer.HasSynced) {
 		return fmt.Errorf("failed to wait for caches to sync")
 	}
 
@@ -171,7 +213,7 @@ func (c *Controller) syncConfigMap(event client.Event) error {
 		fmt.Print(msg)
 		return fmt.Errorf(msg)
 	}
-	klog.V(0).Infof("verb %s obj namespace %s name %s", event.Verb, cm.Namespace, cm.Name)
+	klog.V(5).Infof("verb %s obj namespace %s configmap name %s", event.Verb, cm.Namespace, cm.Name)
 	// since we don't mutate we do not copy
 	switch event.Verb {
 	case client.DeleteObjectAction:
@@ -190,9 +232,9 @@ func (c *Controller) syncConfigMap(event client.Event) error {
 	return nil
 }
 
-func (c *Controller) addSecretToQueue(cm *corev1.Secret, verb client.ObjectAction) {
+func (c *Controller) addSecretToQueue(s *corev1.Secret, verb client.ObjectAction) {
 	event := client.Event{
-		Object: cm,
+		Object: s,
 		Verb:   verb,
 	}
 	c.secretWorkqueue.Add(event)
@@ -268,7 +310,7 @@ func (c *Controller) syncSecret(event client.Event) error {
 		return fmt.Errorf("unexpected object vs. secret: %v", event.Object.GetObjectKind().GroupVersionKind())
 	}
 	// since we don't mutate we do not copy
-	klog.V(0).Infof("verb %s obj namespace %s name %s", event.Verb, secret.Namespace, secret.Name)
+	klog.V(5).Infof("verb %s obj namespace %s secret name %s", event.Verb, secret.Namespace, secret.Name)
 	switch event.Verb {
 	case client.DeleteObjectAction:
 		objcache.DelSecret(secret)
@@ -283,5 +325,99 @@ func (c *Controller) syncSecret(event client.Event) error {
 	default:
 		return fmt.Errorf("unexpected secret event action: %s", event.Verb)
 	}
+	return nil
+}
+
+func (c *Controller) addShareToQueue(s *sharev1alpha1.Share, verb client.ObjectAction) {
+	event := client.Event{
+		Object: s,
+		Verb:   verb,
+	}
+	c.shareWorkqueue.Add(event)
+}
+
+func (c *Controller) shareEventHandler() cache.ResourceEventHandlerFuncs {
+	return cache.ResourceEventHandlerFuncs{
+		AddFunc: func(o interface{}) {
+			switch v := o.(type) {
+			case *sharev1alpha1.Share:
+				c.addShareToQueue(v, client.AddObjectAction)
+			default:
+				//log unrecognized type
+			}
+		},
+		UpdateFunc: func(o, n interface{}) {
+			switch v := o.(type) {
+			case *sharev1alpha1.Share:
+				c.addShareToQueue(v, client.UpdateObjectAction)
+			default:
+				//log unrecognized type
+			}
+		},
+		DeleteFunc: func(o interface{}) {
+			switch v := o.(type) {
+			case cache.DeletedFinalStateUnknown:
+				switch vv := v.Obj.(type) {
+				case *sharev1alpha1.Share:
+					// log recovered deleted obj from tombstone via vv.GetName()
+					c.addShareToQueue(vv, client.DeleteObjectAction)
+				default:
+					// log  error decoding obj tombstone
+				}
+			case *sharev1alpha1.Share:
+				c.addShareToQueue(v, client.DeleteObjectAction)
+			default:
+				//log unrecognized type
+			}
+		},
+	}
+}
+
+func (c *Controller) shareEventProcessor() {
+	for {
+		obj, shutdown := c.shareWorkqueue.Get()
+		if shutdown {
+			return
+		}
+
+		func() {
+			defer c.shareWorkqueue.Done(obj)
+
+			event, ok := obj.(client.Event)
+			if !ok {
+				c.shareWorkqueue.Forget(obj)
+				return
+			}
+
+			if err := c.syncShare(event); err != nil {
+				c.shareWorkqueue.AddRateLimited(obj)
+			} else {
+				c.shareWorkqueue.Forget(obj)
+			}
+		}()
+	}
+}
+
+func (c *Controller) syncShare(event client.Event) error {
+	// copy in case we start updating conditions
+	obj := event.Object.DeepCopyObject()
+	share, ok := obj.(*sharev1alpha1.Share)
+	if share == nil || !ok {
+		return fmt.Errorf("unexpected object vs. share: %v", event.Object.GetObjectKind().GroupVersionKind())
+	}
+	klog.V(5).Infof("verb %s share name %s", event.Verb, share.Name)
+	switch event.Verb {
+	case client.DeleteObjectAction:
+		//TODO GGM delete any pod volumes steming from this share
+	case client.AddObjectAction:
+		//TODO GGM possibly add to cache, or expose the lister, for the csi driver
+		// to map to the csi driver volumeAttributes 'share' key
+	case client.UpdateObjectAction:
+		//TODO GGM possibly add to cache, or expose the lister, for the csi driver
+		// to map to the csi driver volumeAttributes 'share' key
+	default:
+		return fmt.Errorf("unexpected share event action: %s", event.Verb)
+	}
+
 	return nil
 }

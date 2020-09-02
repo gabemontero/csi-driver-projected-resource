@@ -23,6 +23,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	objcache "github.com/openshift/csi-driver-projected-resource/pkg/cache"
 	"google.golang.org/grpc/codes"
@@ -54,12 +55,14 @@ type hostPath struct {
 }
 
 type hostPathVolume struct {
-	VolName       string     `json:"volName"`
-	VolID         string     `json:"volID"`
-	VolSize       int64      `json:"volSize"`
-	VolPath       string     `json:"volPath"`
-	VolAccessType accessType `json:"volAccessType"`
-	TargetPath    string     `json:"targetPath"`
+	VolName        string     `json:"volName"`
+	VolID          string     `json:"volID"`
+	VolSize        int64      `json:"volSize"`
+	VolPath        string     `json:"volPath"`
+	VolAccessType  accessType `json:"volAccessType"`
+	TargetPath     string     `json:"targetPath"`
+	SharedDataKey  string     `json:"sharedDataKey"`
+	SharedDataKind string     `json:"sharedDataKind"`
 }
 
 var (
@@ -80,7 +83,7 @@ func init() {
 }
 
 type HostPathDriver interface {
-	createHostpathVolume(volID, podNamespace, podName, podUID, podSA, targetPath string, cap int64, volAccessType accessType) (*hostPathVolume, error)
+	createHostpathVolume(volID, volPath, targetPath string, cap int64, volAccessType accessType) (*hostPathVolume, error)
 	deleteHostpathVolume(volID string) error
 	getVolumePath(volID, podNamespace, podName, podUID, podSA string) string
 	mapVolumeToPod(hpv *hostPathVolume) error
@@ -151,7 +154,11 @@ func createFile(path string, buf []byte) {
 	file.Write(buf)
 }
 
-func commonUpsertRanger(podPath string, key, value interface{}) bool {
+func commonUpsertRanger(podPath, filter string, key, value interface{}) bool {
+	klog.V(0).Infof("GGM upsert filter %s key %s abort %v", filter, key, key != filter)
+	if key != filter {
+		return true
+	}
 	buf, err := json.MarshalIndent(value, "", "    ")
 	if err != nil {
 		klog.Errorf("error marshalling: %s", err.Error())
@@ -163,52 +170,60 @@ func commonUpsertRanger(podPath string, key, value interface{}) bool {
 	return true
 }
 
-func commonDeleteRanger(podPath string, key interface{}) bool {
+func commonDeleteRanger(podPath, filter string, key interface{}) bool {
+	if key != filter {
+		return true
+	}
 	podFilePath := filepath.Join(podPath, fmt.Sprintf("%s", key))
 	os.Remove(podFilePath)
 	return true
 }
 
 func (hp *hostPath) mapVolumeToPod(hpv *hostPathVolume) error {
-	podConfigMapsPath := filepath.Join(hpv.TargetPath, "configmaps")
+	klog.V(0).Infof("GGM1 mapVolumeToPod %#v", hpv)
 	// for now, since os.MkdirAll does nothing and returns no error when the path already
 	// exists, we have a common path for both create and update; but if we change the file
 	// system interaction mechanism such that create and update are treated differently, we'll
 	// need separate callbacks for each
-	err := os.MkdirAll(podConfigMapsPath, 0777)
-	if err != nil {
-		return err
+	switch strings.TrimSpace(hpv.SharedDataKind) {
+	case "ConfigMap":
+		podConfigMapsPath := filepath.Join(hpv.TargetPath, "configmaps")
+		err := os.MkdirAll(podConfigMapsPath, 0777)
+		if err != nil {
+			return err
+		}
+		upsertRangerCM := func(key, value interface{}) bool {
+			return commonUpsertRanger(podConfigMapsPath, hpv.SharedDataKey, key, value)
+		}
+		objcache.RegisterConfigMapUpsertCallback(hpv.VolID, upsertRangerCM)
+		deleteRangerCM := func(key, value interface{}) bool {
+			return commonDeleteRanger(podConfigMapsPath, hpv.SharedDataKey, key)
+		}
+		objcache.RegisterConfigMapDeleteCallback(hpv.VolID, deleteRangerCM)
+	case "Secret":
+		podSecretsPath := filepath.Join(hpv.TargetPath, "secrets")
+		err := os.MkdirAll(podSecretsPath, 0777)
+		if err != nil {
+			return err
+		}
+		upsertRangerSec := func(key, value interface{}) bool {
+			return commonUpsertRanger(podSecretsPath, hpv.SharedDataKey, key, value)
+		}
+		objcache.RegisterSecretUpsertCallback(hpv.VolID, upsertRangerSec)
+		deleteRangerSec := func(key, value interface{}) bool {
+			return commonDeleteRanger(podSecretsPath, hpv.SharedDataKey, key)
+		}
+		objcache.RegisterSecretDeleteCallback(hpv.VolID, deleteRangerSec)
+	default:
+		return fmt.Errorf("invalid share backing resource kind %s", hpv.SharedDataKind)
 	}
-	upsertRangerCM := func(key, value interface{}) bool {
-		return commonUpsertRanger(podConfigMapsPath, key, value)
-	}
-	objcache.RegisterConfigMapUpsertCallback(hpv.VolID, upsertRangerCM)
-	deleteRangerCM := func(key, value interface{}) bool {
-		return commonDeleteRanger(podConfigMapsPath, key)
-	}
-	objcache.RegisterConfigMapDeleteCallback(hpv.VolID, deleteRangerCM)
 
-	podSecretsPath := filepath.Join(hpv.TargetPath, "secrets")
-	err = os.MkdirAll(podSecretsPath, 0777)
-	if err != nil {
-		return err
-	}
-	upsertRangerSec := func(key, value interface{}) bool {
-		return commonUpsertRanger(podSecretsPath, key, value)
-	}
-	objcache.RegisterSecretUpsertCallback(hpv.VolID, upsertRangerSec)
-	deleteRangerSec := func(key, value interface{}) bool {
-		return commonDeleteRanger(podSecretsPath, key)
-	}
-	objcache.RegisterSecretDeleteCallback(hpv.VolID, deleteRangerSec)
 	return nil
 }
 
 // createVolume create the directory for the hostpath volume.
 // It returns the volume path or err if one occurs.
-func (hp *hostPath) createHostpathVolume(volID, podNamespace, podName, podUID, podSA, targetPath string, cap int64, volAccessType accessType) (*hostPathVolume, error) {
-	volPath := hp.getVolumePath(volID, podNamespace, podName, podUID, podSA)
-
+func (hp *hostPath) createHostpathVolume(volID, volPath, targetPath string, cap int64, volAccessType accessType) (*hostPathVolume, error) {
 	switch volAccessType {
 	case mountAccess:
 		err := os.MkdirAll(volPath, 0777)

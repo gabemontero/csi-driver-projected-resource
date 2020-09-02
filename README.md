@@ -22,15 +22,23 @@ Enhancement proposal.
 
 **NOT FULLY IMPLEMENTED**
 
-The latest commit of the master branch solely brings in the subset of the hostpath driver needed to validate 
-the basic in-line ephemeral volume scenario articulated below. 
+The latest commit of the master branch solely introduces both the `Share` CRD and the `projectedresoure.storage.openshift.io`
+API group and version `v1alpha1`.  
+
+A controller exists for watching this new CRD.
+
+The reference to the `share` object in the `volumeAttributes` in a declared CSI volume within a `Pod` is used to 
+fuel a `SubectAccessReview` check.  The `ServiceAccount` for the `Pod` must have `get` access to the `Share` in
+order for the referenced `ConfigMap` and `Secret` to be mounted in the `Pod`.
+
+ 
 
 
 ## Deployment
 The easiest way to test the Hostpath driver is to run the `deploy.sh`.
 
 ```
-# deploy hostpath driver
+# deploy csi projectedresource driver
 $ deploy/deploy.sh
 ```
 
@@ -70,10 +78,17 @@ csi-hostpathplugin-m4smv   2/2     Running   0          23m
 csi-hostpathplugin-x9xjw   2/2     Running   0          23m
 ```
 
-Next, let's start up the simple test application.  From the root directory, deploy the application pod found in directory `./examples`:
+Next, let's start up the simple test application.  From the root directory, deploy from the `./examples` directory the 
+application `Pod`, along with the associated test namespace, `Share`, `ClusterRole`, and `ClusterRoleBinding` definitions
+needed to illustrate the mounting of one of the API types (in this instance a `ConfigMap` from the `openshift-config`
+namespace) into the `Pod`:
 
 ```shell
-$ kubectl apply -f ./examples/csi-app.yaml
+$ kubectl apply -f ./examples
+namespace/my-csi-app-namespace created
+clusterrole.rbac.authorization.k8s.io/projected-resource-my-share created
+clusterrolebinding.rbac.authorization.k8s.io/projected-resource-my-share created
+share.projectedresource.storage.openshift.io/my-share created
 pod/my-csi-app created
 ```
 
@@ -164,41 +179,8 @@ Events:
   Normal  Started         28m        kubelet, ip-10-0-163-121.us-west-2.compute.internal  Started container my-frontend
 ```
 
-## Confirm the driver works
-The driver is configured to create new volumes under `/csi-data-dir` inside the hostpath container that is specified in 
-the plugin DaemonSet. 
 
-A file written in a properly mounted Hostpath volume inside an application should show up inside the Hostpath container.  
-The following steps confirms that Hostpath is working properly.  First, create a file from the application pod as shown:
-
-```shell
-$ kubectl exec -it my-csi-app /bin/sh
-/ # touch /data/hello-world
-/ # exit
-```
-
-Next, ssh into the Hostpath containers of each of the 3 pods and verify that the file shows up.  
-
-**NOTE**:  Given node affinity, the file will only show up in one of the 3 containers.  That's OK :-).  When we are 
-done, we want our projected resource shared data access to always be local node.  Each of the pods will watch 
-the projected resources and store on their local hosts.
-
-So get the list of `csi-hostpathplugin*` pod names, and then: 
-
-```shell
-$ kubectl exec -it <each of the 3 pod names> -c hostpath /bin/sh
-
-```
-Then, use the following command to locate the file. If everything works OK you should get a result similar to the following:
-
-```shell
-/ # find / -name hello-world
-/var/lib/kubelet/pods/34bbb561-d240-4483-a56c-efcc6504518c/volumes/kubernetes.io~csi/pvc-ad827273-8d08-430b-9d5a-e60e05a2bc3e/mount/hello-world
-/csi-data-dir/42bdc1e0-624e-11ea-beee-42d40678b2d1/hello-world
-/ # exit
-```
-
-## Confirm openshift-config Secret/ConfigMap data present
+## Confirm openshift-config ConfigMap data is present
 
 This current version of the driver as POC also watches the `ConfigMaps` and `Secrets` in the `openshift-config` 
 namespace and places that data in the provide `Volume` as well.
@@ -206,7 +188,7 @@ namespace and places that data in the provide `Volume` as well.
 To verify, go back into the `Pod` named `my-csi-app` and list the contents:
 
   ```shell
-  $ kubectl exec -it my-csi-app /bin/sh
+  $ kubectl exec  -n my-csi-app-namespace -it my-csi-app /bin/sh
   / # ls -lR /data
   / # exit
   ```
@@ -215,40 +197,25 @@ You should see contents like:
 
 ```shell
 ls -lR /data
+ls -lR /data
 /data:
-total 8
-drwxr-xr-x    2 root     root          4096 Aug  7 16:07 configmaps
-drwxr-xr-x    2 root     root          4096 Aug  7 16:07 secrets
+total 0
+drwxr-xr-x    2 root     root            60 Sep  2 19:38 configmaps
 
 /data/configmaps:
-total 36
--rw-r--r--    1 root     root          2050 Aug  7 16:07 openshift-config:admin-kubeconfig-client-ca
--rw-r--r--    1 root     root          1992 Aug  7 16:07 openshift-config:etcd-ca-bundle
--rw-r--r--    1 root     root          2024 Aug  7 16:07 openshift-config:etcd-metric-serving-ca
--rw-r--r--    1 root     root          1994 Aug  7 16:07 openshift-config:etcd-serving-ca
--rw-r--r--    1 root     root           840 Aug  7 16:07 openshift-config:initial-etcd-ca
--rw-r--r--    1 root     root          6848 Aug  7 16:07 openshift-config:initial-kube-apiserver-server-ca
--rw-r--r--    1 root     root           970 Aug  7 16:07 openshift-config:openshift-install
--rw-r--r--    1 root     root           990 Aug  7 16:07 openshift-config:openshift-install-manifests
-
-/data/secrets:
-total 236
--rw-r--r--    1 root     root         12749 Aug  7 16:07 openshift-config:builder-dockercfg-lnx4c
--rw-r--r--    1 root     root         24100 Aug  7 16:07 openshift-config:builder-token-r87zm
--rw-r--r--    1 root     root         23657 Aug  7 16:07 openshift-config:builder-token-s2rcl
--rw-r--r--    1 root     root         12749 Aug  7 16:07 openshift-config:default-dockercfg-pzxpf
--rw-r--r--    1 root     root         23657 Aug  7 16:07 openshift-config:default-token-fk5mn
--rw-r--r--    1 root     root         24100 Aug  7 16:07 openshift-config:default-token-pv2n2
--rw-r--r--    1 root     root         12806 Aug  7 16:07 openshift-config:deployer-dockercfg-rk4mr
--rw-r--r--    1 root     root         23668 Aug  7 16:07 openshift-config:deployer-token-ktqgk
--rw-r--r--    1 root     root         24111 Aug  7 16:07 openshift-config:deployer-token-mnglk
--rw-r--r--    1 root     root          4764 Aug  7 16:07 openshift-config:etcd-client
--rw-r--r--    1 root     root          4822 Aug  7 16:07 openshift-config:etcd-metric-client
--rw-r--r--    1 root     root          4730 Aug  7 16:07 openshift-config:etcd-metric-signer
--rw-r--r--    1 root     root          4696 Aug  7 16:07 openshift-config:etcd-signer
--rw-r--r--    1 root     root          3185 Aug  7 16:07 openshift-config:initial-service-account-private-key
--rw-r--r--    1 root     root          4729 Aug  7 16:07 openshift-config:pull-secret
+total 4
+-rw-r--r--    1 root     root           970 Sep  2 19:38 openshift-config:openshift-install
+/ # 
 ```
 
 To facilitate validation of the contents, including post-creation updates, the data is currently 
-stored as formatted `json`. 
+stored as formatted `json`.
+
+If you want to try other `ConfigMaps` or a `Secret`, first clear out the existing application:
+
+```shell
+$ oc delete -f ./examples 
+``` 
+
+And the edit `./examples/02-csi-share.yaml` and change the `backingResource` stanza to point to the item 
+you want to share, and then re-run `oc apply -f ./examples`.

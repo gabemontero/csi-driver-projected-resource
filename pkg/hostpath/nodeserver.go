@@ -18,26 +18,34 @@ package hostpath
 
 import (
 	"fmt"
+	"github.com/openshift/csi-driver-projected-resource/pkg/cache"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"os"
 	"strings"
 
-	"golang.org/x/net/context"
-
 	"github.com/container-storage-interface/spec/lib/go/csi"
+	sharev1alpha1 "github.com/openshift/csi-driver-projected-resource/pkg/api/projectedresource/v1alpha1"
+	"github.com/openshift/csi-driver-projected-resource/pkg/client"
+	"github.com/openshift/csi-driver-projected-resource/pkg/controller"
+	"golang.org/x/net/context"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	authorizationv1 "k8s.io/api/authorization/v1"
+	kerrors "k8s.io/apimachinery/pkg/api/errors"
+	kubernetes "k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
 	"k8s.io/utils/mount"
 )
 
 const (
-	TopologyKeyNode = "topology.hostpath.csi/node"
-	CSIPodName      = "csi.storage.k8s.io/pod.name"
-	CSIPodNamespace = "csi.storage.k8s.io/pod.namespace"
-	CSIPodUID       = "csi.storage.k8s.io/pod.uid"
-	CSIPodSA        = "csi.storage.k8s.io/serviceAccount.name"
-	CSIEphemeral    = "csi.storage.k8s.io/ephemeral"
+	TopologyKeyNode           = "topology.hostpath.csi/node"
+	CSIPodName                = "csi.storage.k8s.io/pod.name"
+	CSIPodNamespace           = "csi.storage.k8s.io/pod.namespace"
+	CSIPodUID                 = "csi.storage.k8s.io/pod.uid"
+	CSIPodSA                  = "csi.storage.k8s.io/serviceAccount.name"
+	CSIEphemeral              = "csi.storage.k8s.io/ephemeral"
+	ProjectedResourceShareKey = "share"
 )
 
 type nodeServer struct {
@@ -45,14 +53,19 @@ type nodeServer struct {
 	maxVolumesPerNode int64
 	hp                HostPathDriver
 	mounter           mount.Interface
+	client            kubernetes.Interface
 }
 
 func NewNodeServer(hp *hostPath) *nodeServer {
+	kubeRestConfig, _ := client.GetConfig()
+	kubeClient, _ := kubernetes.NewForConfig(kubeRestConfig)
+
 	return &nodeServer{
 		nodeID:            hp.nodeID,
 		maxVolumesPerNode: hp.maxVolumesPerNode,
 		hp:                hp,
 		mounter:           mount.New(""),
+		client:            kubeClient,
 	}
 }
 
@@ -63,6 +76,106 @@ func getPodDetails(volumeContext map[string]string) (string, string, string, str
 	podUID, _ := volumeContext[CSIPodUID]
 	return podNamespace, podName, podUID, podSA
 
+}
+
+func (ns *nodeServer) validateProjectedResource(req *csi.NodePublishVolumeRequest) (*sharev1alpha1.Share, error) {
+	shareName, sok := req.GetVolumeContext()[ProjectedResourceShareKey]
+	if !sok || len(strings.TrimSpace(shareName)) == 0 {
+		return nil, status.Errorf(codes.InvalidArgument,
+			"the projectedresource csi driver reference is missing the volumeAttribute 'share'")
+	}
+
+	share, err := controller.GetController().GetListers().Shares.Get(shareName)
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument,
+			"the projectedresource csi driver volumeAttribute 'share' reference had an error: %s", err.Error())
+	}
+	klog.V(0).Infof("GGM2 share %#v", share)
+
+	switch strings.TrimSpace(share.Spec.BackingResource.Kind) {
+	case "Secret":
+	case "ConfigMap":
+	default:
+		return nil, status.Errorf(codes.InvalidArgument,
+			"the projectedresource %s has an invalid backing resource kind %s", shareName, share.Spec.BackingResource.Kind)
+	}
+
+	if len(strings.TrimSpace(share.Spec.BackingResource.Namespace)) == 0 {
+		return nil, status.Errorf(codes.InvalidArgument,
+			"the projectedresource %s backing resource namespace needs to be set", shareName)
+	}
+	if len(strings.TrimSpace(share.Spec.BackingResource.Name)) == 0 {
+		return nil, status.Errorf(codes.InvalidArgument,
+			"the projectedresource %s backing resource name needs to be set", shareName)
+	}
+
+	podNamespace, podName, _, podSA := getPodDetails(req.GetVolumeContext())
+
+	sarClient := ns.client.AuthorizationV1().SubjectAccessReviews()
+	resourceAttributes := &authorizationv1.ResourceAttributes{
+		Verb:     "get",
+		Group:    "projectedresource.storage.openshift.io",
+		Resource: "shares",
+		Name:     shareName,
+	}
+	sar := &authorizationv1.SubjectAccessReview{
+		Spec: authorizationv1.SubjectAccessReviewSpec{
+			ResourceAttributes: resourceAttributes,
+			User:               fmt.Sprintf("system:serviceaccount:%s:%s", podNamespace, podSA),
+		}}
+
+	resp, err := sarClient.Create(context.TODO(), sar, metav1.CreateOptions{})
+	if err == nil && resp != nil {
+		if resp.Status.Allowed {
+			klog.V(0).Infof("GGM3 share allowed")
+			return share, nil
+		}
+		return nil, status.Errorf(codes.PermissionDenied,
+			"subjectaccessreviews share %s podNamespace %s podName %s podSA %s returned forbidden",
+			shareName, podNamespace, podName, podSA)
+	}
+
+	if kerrors.IsForbidden(err) {
+		return nil, status.Errorf(codes.PermissionDenied,
+			"subjectaccessreviews share %s podNamespace %s podName %s podSA %s returned forbidden: %s",
+			shareName, podNamespace, podName, podSA, err.Error())
+	}
+
+	return nil, status.Errorf(codes.Internal,
+		"subjectaccessreviews share %s podNamespace %s podName %s podSA %s returned error: %s",
+		shareName, podNamespace, podName, podSA, err.Error())
+}
+
+// validateVolumeContext return values:
+// - podNamespace
+// - podNames
+// - podUID
+// - podSA
+func (ns *nodeServer) validateVolumeContext(req *csi.NodePublishVolumeRequest) (string, string, string, string, error) {
+
+	podNamespace, podName, podUID, podSA := getPodDetails(req.GetVolumeContext())
+	klog.V(4).Infof("NodePublishVolume pod %s ns %s sa %s uid %s",
+		podName,
+		podNamespace,
+		podSA,
+		podUID)
+
+	if len(podName) == 0 || len(podNamespace) == 0 || len(podUID) == 0 || len(podSA) == 0 {
+		return "", "", "", "", status.Error(codes.InvalidArgument,
+			fmt.Sprintf("Volume attributes missing required set for pod: namespace: %s name: %s uid: %s, sa: %s",
+				podNamespace, podName, podUID, podSA))
+	}
+	ephemeralVolume := req.GetVolumeContext()[CSIEphemeral] == "true" ||
+		req.GetVolumeContext()[CSIEphemeral] == "" // Kubernetes 1.15 doesn't have csi.storage.k8s.io/ephemeral.
+
+	if !ephemeralVolume {
+		return "", "", "", "", status.Error(codes.InvalidArgument, "Non-ephemeral request made")
+	}
+
+	if req.GetVolumeCapability().GetMount() == nil {
+		return "", "", "", "", status.Error(codes.InvalidArgument, "only support mount access type")
+	}
+	return podNamespace, podName, podUID, podSA, nil
 }
 
 func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolumeRequest) (*csi.NodePublishVolumeResponse, error) {
@@ -82,31 +195,19 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 		return nil, status.Error(codes.InvalidArgument, "Volume attributes missing in request")
 	}
 
-	podNamespace, podName, podUID, podSA := getPodDetails(req.GetVolumeContext())
-	klog.V(4).Infof("NodePublishVolume pod %s ns %s sa %s uid %s",
-		podName,
-		podNamespace,
-		podSA,
-		podUID)
-
-	if len(podName) == 0 || len(podNamespace) == 0 || len(podUID) == 0 || len(podSA) == 0 {
-		return nil, status.Error(codes.InvalidArgument,
-			fmt.Sprintf("Volume attributes missing required set for pod: namespace: %s name: %s uid: %s, sa: %s",
-				podNamespace, podName, podUID, podSA))
-	}
-	ephemeralVolume := req.GetVolumeContext()[CSIEphemeral] == "true" ||
-		req.GetVolumeContext()[CSIEphemeral] == "" // Kubernetes 1.15 doesn't have csi.storage.k8s.io/ephemeral.
-
-	if !ephemeralVolume {
-		return nil, status.Error(codes.InvalidArgument, "Non-ephemeral request made")
+	podNamespace, podName, podUID, podSA, err := ns.validateVolumeContext(req)
+	if err != nil {
+		return nil, err
 	}
 
-	if req.GetVolumeCapability().GetMount() == nil {
-		return nil, status.Error(codes.InvalidArgument, "only support mount access type")
+	share, err := ns.validateProjectedResource(req)
+	if err != nil {
+		return nil, err
 	}
 
 	targetPath = req.GetTargetPath()
-	vol, err := ns.hp.createHostpathVolume(req.GetVolumeId(), podNamespace, podName, podUID, podSA, targetPath, maxStorageCapacity, mountAccess)
+	volPath := ns.hp.getVolumePath(req.GetVolumeId(), podNamespace, podName, podUID, podSA)
+	vol, err := ns.hp.createHostpathVolume(req.GetVolumeId(), volPath, targetPath, maxStorageCapacity, mountAccess)
 	if err != nil && !os.IsExist(err) {
 		klog.Error("ephemeral mode failed to create volume: ", err)
 		return nil, status.Error(codes.Internal, err.Error())
@@ -116,6 +217,8 @@ func (ns *nodeServer) NodePublishVolume(ctx context.Context, req *csi.NodePublis
 	if vol.VolAccessType != mountAccess {
 		return nil, status.Error(codes.InvalidArgument, "cannot publish a non-mount volume as mount volume")
 	}
+	vol.SharedDataKind = share.Spec.BackingResource.Kind
+	vol.SharedDataKey = cache.BuildKey(share.Spec.BackingResource.Namespace, share.Spec.BackingResource.Name)
 
 	notMnt, err := mount.IsNotMountPoint(ns.mounter, targetPath)
 
